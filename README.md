@@ -7,7 +7,7 @@ Various troubleshooting tips for the robot:
 MECHANICAL:
 
   Issue 1: shoulder to elbow attachment looseness
-    Resolution: insert a small spacer (thin plastic - preferably compressible ) to take up the space. Do not use something         that is both rigid & too thick because the fastener could break out of the back of the elbow joint.
+  Resolution: insert a small spacer (thin plastic - preferably compressible ) to take up the space. Do not use something that is both rigid & too thick because the fastener could break out of the back of the elbow joint. A folded strip of yoghut lid could work. 
 
 ELECTRICAL: 
 
