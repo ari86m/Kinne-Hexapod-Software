@@ -3,6 +3,7 @@ Software for hexapod robot designed by Wayne Kinne and built at Michigan LDS Enc
 BOM: Arduino AT Mega 2560, custom shield board, PS2 compatible wireless controller & receiver, 7.2V NiMH hobby battery, 12 Tower Pro MG996R servos & lots of 3D printed parts made by Wayne Kinne. 
 
 Various troubleshooting tips for the robot:
+
 MECHANICAL:
 
   Issue 1: shoulder to elbow attachment looseness
