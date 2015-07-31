@@ -3,6 +3,7 @@ Software for hexapod robot designed by Wayne Kinne and built at Michigan LDS Enc
 BOM: Arduino AT Mega 2560, custom shield board, PS2 compatible wireless controller & receiver, 7.2V NiMH hobby battery, 12 Tower Pro MG996R servos & lots of 3D printed parts made by Wayne Kinne. 
 
 GOOD PRACTICES:
+
 1- The 9V battery should be Alkaline or better. A heavy duty battery reading 9.5V may not provide enough current to run the Arduino with our shield board even with out any periferal LED's or sonar.
 2- Prior to servo power on, move joints near a middle range position in case they do not have a signal from the Arduino. They will jump toward their zero degree position until the servo control electronics realizes the signal is not just a short pulse, but no pulse. A servo near it's zero position could jam up against it's internal hard stops, meaning pushing a rod into the gear teeth & chaning their shape. Afterward, a servo can have a grinding noise & a 'sticking' spot periodically thru its rotation range. 
 
