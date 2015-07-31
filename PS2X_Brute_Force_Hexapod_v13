@@ -1,0 +1,564 @@
+/* PS2X Brute Force Hexapod
+//-------1---------2---------3---------4---------5---------6---------7--
+//  WARNING: declaration int i, j, or k must always be local scope
+v01 ?/?/? by Bill Porter
+  PS2X_Example from GitHub
+v02 07/19/15 by Ari McEntire
+  Brute force forward, reverse, ccw, cw controlled by PS2 remote
+v03 07/19/15 by Ari McEntire  
+  changed to L analog joystick, no blend, must be at maximums to work. 
+  Verified all 4 motions. Added check at begin of moveHex to see if no motion commanded.
+  Improvement: spins fall on belly but do spin, torque of rotation may be pulling arms outward
+               recovers when walking forward or backward
+v04 07/20/15 by Ari McEntire
+  fixed issue from v03 by removing return from default statement
+  added speed value to call motion with - to be used for robot speed control
+  added global cornerAdd values to all corner angles to compensate for mid larger step
+  adjusted delay timings
+  added function to lower & raise body "Bang, your dead"
+  ToDo: modify copy of neutral position array on the fly with input & still walk from there
+v06 07/20/15 by Ari McEntire
+  added slow lower
+  bug: slow raise is super fast.
+  BUG: big bug: became worse, caused all buttons to be read. Also some feedback causing receibver to be powered w/o Vcc
+    bug repeated with new receiver, Wayne's Arduino & shield/receiver, Eric's transmitter
+v10 07/22/15 by Ari McEntire
+  re-ported to PS2X_Example as base program & error rate reduced from 1 per 1-5 sec to 1 per 1-10 minutes
+  filtered out comm error (do not continue loop)
+  removed 2nd baud rate & changed baud rate to 9600
+  updates & confirmed working: walk forward/backward, spin L/R, raise/lower fast, raise/lower slow, rumble
+v11 07/22/15 by Ari McEntire
+  added jaw definition & moves
+v12 07/22/15 by Nathan Hogge
+  added moveNeutralPosition function (with wiggle option)
+  added wave function (makes the robot lift its front right leg and waves)
+  bind moveNeutralPosition to CIRCLE
+  bind wave to SQUARE
+  add elses so that two robot actions do not occur in same loop (will enforce button prioirity)
+v13 07/22/15 by Ari McEntire  
+  corrected jaw definitions
+  added function tap() to TRIANGLE
+*/
+#include <PS2X_lib.h>  //for v1.6
+#include <Servo.h>  // servo library
+
+/******************************************************************
+ * set pins connected to PS2 controller:
+ *   - 1e column: original 
+ *   - 2e colmun: Stef?
+ * replace pin numbers by the ones you use
+ ******************************************************************/
+#define PS2_DAT        12  //14    
+#define PS2_CMD        11  //15
+#define PS2_SEL        10  //16
+#define PS2_CLK         9  //17
+
+/******************************************************************
+ * select modes of PS2 controller:
+ *   - pressures = analog reading of push-butttons 
+ *   - rumble    = motor rumbling
+ * uncomment 1 of the lines for each mode selection
+ ******************************************************************/
+//#define pressures   true
+#define pressures   false
+#define rumble      true
+//#define rumble      false
+
+PS2X ps2x; // create PS2 Controller Class
+
+//right now, the library does NOT support hot pluggable controllers, meaning 
+//you must always either restart your Arduino after you connect the controller, 
+//or call config_gamepad(pins) again after connecting the controller.
+
+int error = 0;
+byte type = 0;
+byte vibrate = 0;
+
+/*************************************************************************************************
+SERVO Initializations
+******************************************************************************************/
+// Initialize Global Variables
+int pLed = 13;        // LED pin
+Servo servo[3][2][3]; // servo control object, Arms
+Servo jaw; // servo control object, jaw
+
+// array of 12 servos for 3 joints on 6 arms
+// initialize servo array indexes
+int frt = 0;          // front row, head end
+int mid = 1;          // middle row
+int bck = 2;          // back row, tail end
+//----------
+int lft = 0;          // left side, as viewed from above
+int rgt = 1;          // right side, as viewed from above
+//----------
+int sdr = 0;          // shoulder joint
+int elb = 1;          // elbow joint
+int rst = 2;          // wrist joint (if installed)
+/********************************************************************************************************
+******* Determine zero position joint values  ***********************************************************
+           \ /              While robot is on its back, find joint angles that straighten  
+         /Head \            all the leg joints like so: 
+ ---I---o       o---I---    -Shoulder: all legs parallel like painting to the left,
+ ---I---o       o---I---    -Elbow: parallel with table or floor (while on, pull toward floor)
+ ---I---o Tail  o---I---    
+          \   /                  
+            V
+ Coordinates for robot when resting on belly:                       
+    Y
+    |
+    o-> X     Z is up
+*/
+// Zero Point Array for initial calibration - must match the robot
+const int zpa[3][2][3] = { // zero values array (for common reference from robot to robot)
+  {{58, 60, 70}, {130, 55, 50}}, // Front L & R values for sdr,elb,rst
+  {{88, 70, 70}, {90, 65, 55}},  // Middle L & R values for sdr,elb,rst
+  {{117, 60, 70}, {67, 50, 65}}  // Back L & R values for sdr,elb,rst
+  };
+const int jawMinMax[] = {60, 150}; // min & max values for jaw 
+// ****************** Ari's Robot array *************************
+int npa[3][2][3]; // neutral values array (for common starting pose from robot to robot)
+
+int moveType; // 0 = Fwd, 1 = Bck, 2 = ccw, 3 = cw, 4 = nothing  <<<<<------------------------
+int cornerLegOffset = 35; // corner leg shoulders rotated out from zero position (degrees)
+int stepAngle = 12; // not optimized
+int cornerAdd = 7; // add more step angle to corner shoulder joints
+int speedShoulder = 100; // speed of shoulder motions (for future use)
+int liftAngle = 50; // how high to lift the legs relative to neutral position array (npa)
+int lowerAngle = 0; // how low to put the legs down relative to neutral position array (npa)
+int delayTime = 30; // delay between groups of servo moves
+int legUpDnDelay = 100; // wait for legs to touch/lift from floor before lifting other legs
+int smoothLiftAngle = 0; // smoothly change the height at which the robot stands
+int smoothJawAngle = 90; // smoothly open & close jaws WARNING: HOLDING TOO TIGHT INCREASES CHANCE OF SURVO FAILURE
+int bugCommCount = 0; // count communication bugs that are filtered
+/*************************************************************************************************
+End SERVO Initializations
+******************************************************************************************/
+
+void setup(){
+ 
+  Serial.begin(9600); //changed from 57600 in Bill Porter's PS2X_Example
+  delay(300);  //added delay to give wireless ps2 module some time to startup, before configuring it
+   
+  //CHANGES for v1.6 HERE!!! **************PAY ATTENTION*************
+  
+  //setup pins and settings: GamePad(clock, command, attention, data, Pressures?, Rumble?) check for error
+  error = ps2x.config_gamepad(PS2_CLK, PS2_CMD, PS2_SEL, PS2_DAT, pressures, rumble);
+  
+  if(error == 0){
+    Serial.print("Found Controller, configured successful ");
+    Serial.print("pressures = ");
+	if (pressures)  Serial.println("true ");
+	else  Serial.println("false");
+	Serial.print("rumble = ");
+	if (rumble)  Serial.println("true)");
+	else  Serial.println("false");
+    Serial.println("Try out all the buttons, X will vibrate the controller, faster as you press harder;");
+    Serial.println("holding L1 or R1 will print out the analog stick values.");
+    Serial.println("Note: Go to www.billporter.info for updates and to report bugs.");
+  }  
+  else if(error == 1)
+    Serial.println("No controller found, check wiring, see readme.txt to enable debug. visit www.billporter.info for troubleshooting tips");
+  else if(error == 2)
+    Serial.println("Controller found but not accepting commands. see readme.txt to enable debug. Visit www.billporter.info for troubleshooting tips");
+  else if(error == 3)
+    Serial.println("Controller refusing to enter Pressures mode, may not support it. ");
+  
+  type = ps2x.readType(); 
+  switch(type) {
+    case 0:
+      Serial.print("Unknown Controller type found ");
+      break;
+    case 1:
+      Serial.print("DualShock Controller found ");
+      break;
+    case 2:
+      Serial.print("GuitarHero Controller found ");
+      break;
+	case 3:
+      Serial.print("Wireless Sony DualShock Controller found ");
+      break;
+    }
+
+/*************************************************************************************************
+SERVO Initializations
+******************************************************************************************/
+  int i, j, k; // counters
+  
+  servo[frt][lft][sdr].attach(40);
+  servo[frt][lft][elb].attach(42);
+  servo[frt][rgt][sdr].attach(36);
+  servo[frt][rgt][elb].attach(38);
+
+  servo[mid][lft][sdr].attach(46);
+  servo[mid][lft][elb].attach(48);
+  servo[mid][rgt][sdr].attach(30);
+  servo[mid][rgt][elb].attach(32);
+
+  servo[bck][lft][sdr].attach(50);
+  servo[bck][lft][elb].attach(52);
+  servo[bck][rgt][sdr].attach(26);
+  servo[bck][rgt][elb].attach(28);
+
+  jaw.attach(29); // attach jaw servo
+  
+  pinMode(pLed, OUTPUT);  // initialize pin 13 as an output
+
+  // initialize values to zero position & load neutral point array
+  for (int i = 0; i < 3; i++) { // rows of legs (front, middle, back)
+    for (int j = 0; j < 2; j++) { // sides of robot (left, right)
+      for (int k = 0; k < 3; k++) { // joints per leg (shoulder, elbow, (optional wrist))
+        servo[i][j][k].write(zpa[i][j][k] + 10); // set all servos to zero value
+        delay(300);
+        Serial.print("Zero position values for each joint in setup\t"); // debug assignment values
+        Serial.print(i); Serial.print("\t"); // debug assignment values
+        Serial.print(j); Serial.print("\t");
+        Serial.print(k); Serial.print("\t");
+        Serial.println(zpa[i][j][k]);
+        npa[i][j][k] = zpa[i][j][k];    // populate neutral position array
+        }
+      }
+    }
+  
+  // set shoulder joint neutral position for 3DOF legs
+  npa[frt][lft][sdr] += cornerLegOffset;
+  npa[frt][rgt][sdr] -= cornerLegOffset;
+  npa[bck][lft][sdr] -= cornerLegOffset;
+  npa[bck][rgt][sdr] += cornerLegOffset;
+
+  //reset all legs to the neutral position
+  moveNeutralPosition(true);
+  delay(1000); // wait for neutral position visual assessment
+    
+/*************************************************************************************************
+End SERVO Initializations
+******************************************************************************************/
+} // end setup
+
+void loop() {
+  // This loop runs top to bottom after it completes a loop. If any variables need initialization
+  // put them here & put the rest of the loop code inside a while loop. 
+  // The top of loop is Bill Porters example file (formatted shorter) that pertains to the PS2 controller.
+  
+  /* You must Read Gamepad to get new values and set vibration values
+     ps2x.read_gamepad(small motor on/off, larger motor strenght from 0-255)
+     if you don't enable the rumble, use ps2x.read_gamepad(); with no values
+     You should call this at least once a second
+   */  
+  if(error == 1) {//skip loop if no controller found
+    return; 
+  }
+  else { //Assume DualShock Controller
+    ps2x.read_gamepad(false, vibrate); //read controller and set large motor to spin at 'vibrate' speed
+    
+    if(ps2x.Button(PSB_START)) Serial.println("Start is being held"); //will be TRUE as long as button is pressed
+    if(ps2x.Button(PSB_SELECT)) Serial.println("Select is being held");      
+
+    if(ps2x.Button(PSB_PAD_UP)) {      //will be TRUE as long as button is pressed
+      Serial.print("Up held this hard: ");
+      Serial.println(ps2x.Analog(PSAB_PAD_UP), DEC);
+    }
+    if(ps2x.Button(PSB_PAD_RIGHT)){
+      Serial.print("Right held this hard: ");
+      Serial.println(ps2x.Analog(PSAB_PAD_RIGHT), DEC);
+    }
+    if(ps2x.Button(PSB_PAD_LEFT)){
+      Serial.print("LEFT held this hard: ");
+      Serial.println(ps2x.Analog(PSAB_PAD_LEFT), DEC);
+    }
+    if(ps2x.Button(PSB_PAD_DOWN)){
+      Serial.print("DOWN held this hard: ");
+      Serial.println(ps2x.Analog(PSAB_PAD_DOWN), DEC);
+    }   
+
+    vibrate = ps2x.Analog(PSAB_CROSS);  //this will set the large motor vibrate speed based on how hard you press the blue (X) button
+    if (ps2x.NewButtonState()) {        //will be TRUE if any button changes state (on to off, or off to on)
+      if(ps2x.Button(PSB_L3))  Serial.println("L3 pressed");
+      if(ps2x.Button(PSB_R3))  Serial.println("R3 pressed");
+      if(ps2x.Button(PSB_L2))  Serial.println("L2 pressed");
+      if(ps2x.Button(PSB_R2))  Serial.println("R2 pressed");
+      if(ps2x.Button(PSB_TRIANGLE))  Serial.println("Triangle pressed");        
+    }
+
+    if(ps2x.ButtonPressed(PSB_CIRCLE))               //will be TRUE if button was JUST pressed
+      Serial.println("Circle just pressed");
+    if(ps2x.NewButtonState(PSB_CROSS))               //will be TRUE if button was JUST pressed OR released
+      Serial.println("X just changed");
+    if(ps2x.ButtonReleased(PSB_SQUARE))              //will be TRUE if button was JUST released
+      Serial.println("Square just released");     
+
+    if(ps2x.Button(PSB_L1) || ps2x.Button(PSB_R1)) { //print stick values if either is TRUE
+      Serial.print("Stick Values:");
+      Serial.print(ps2x.Analog(PSS_LY), DEC); //Left stick, Y axis. Other options: LX, RY, RX  
+      Serial.print(",");  Serial.print(ps2x.Analog(PSS_LX), DEC); 
+      Serial.print(",");  Serial.print(ps2x.Analog(PSS_RY), DEC); 
+      Serial.print(",");  Serial.println(ps2x.Analog(PSS_RX), DEC); 
+    }
+    //ps2x.read_gamepad(true, 155); // small motor on/off, larger motor strenght from 0-255
+    /*************************************************************************************************
+    Keep All SERVO Actions Here - This part not Bill Porter's code
+    ******************************************************************************************/
+    // using both up & down at the same time as bug filtering. Don't use this combination to control things.
+    if (ps2x.Button(PSB_PAD_DOWN) && ps2x.Button(PSB_PAD_UP)) { // filter out communication bug 
+      delay(50); // keep same delay as end of loop - suspected reason is communication timing
+      Serial.print("Comm BUG filtered this many times:\t"); Serial.println(++bugCommCount);     
+      return; // do not react to any moves
+    }
+    else { // robot servo moves here
+      if (ps2x.Analog(PSS_LY) == 0) { moveType = 0;}
+      else if(ps2x.Analog(PSS_LY) == 255) { moveType = 1;} 
+      else if(ps2x.Analog(PSS_LX) == 0) { moveType = 2;} 
+      else if(ps2x.Analog(PSS_LX) == 255) { moveType = 3;} 
+      else { moveType = 4;}
+    
+      if(ps2x.ButtonPressed(PSB_CIRCLE)) {
+        moveNeutralPosition(false);
+      }
+      else if(ps2x.ButtonPressed(PSB_SQUARE)) {
+        wave();
+      }
+      else if (ps2x.ButtonPressed(PSB_TRIANGLE)) {
+        tap();
+      }
+      if ((ps2x.Analog(PSS_LY) != 127) || (ps2x.Analog(PSS_LX) != 128)){ //if L joystick moved, walk
+        moveHex(moveType, stepAngle, liftAngle, lowerAngle, speedShoulder);
+      }
+      if (ps2x.Button(PSB_PAD_DOWN)) { 
+        rgtTripodUpDn(liftAngle);
+        lftTripodUpDn(liftAngle); 
+
+        Serial.print("Lower Robot to "); Serial.println(liftAngle);
+      }
+      else if(ps2x.Button(PSB_PAD_UP)) {  
+        rgtTripodUpDn(lowerAngle);
+        lftTripodUpDn(lowerAngle); 
+        Serial.print("Raise Robot to "); Serial.println(lowerAngle);
+      }
+    
+      // smoothly lift legs to lower robot body
+      if (ps2x.Button(PSB_PAD_LEFT)) {
+        smoothLiftAngle+=2; 
+        if (smoothLiftAngle > liftAngle) {smoothLiftAngle = liftAngle; }
+        ps2x.read_gamepad(false, 255); // small motor on/off, larger motor strenght from 0-255
+        rgtTripodUpDn(smoothLiftAngle);
+        lftTripodUpDn(smoothLiftAngle); 
+        Serial.print("smoothLiftAngle++ = "); Serial.println(smoothLiftAngle);
+      }
+      else if(ps2x.Button(PSB_PAD_RIGHT)) { 
+        smoothLiftAngle-=2; 
+        if (smoothLiftAngle < lowerAngle) {smoothLiftAngle = lowerAngle; }
+        ps2x.read_gamepad(true, 0); // small motor on/off, larger motor strenght from 0-255
+        rgtTripodUpDn(smoothLiftAngle);
+        lftTripodUpDn(smoothLiftAngle); 
+        Serial.print("smoothLiftAngle-- = "); Serial.println(smoothLiftAngle);
+      }
+      else {
+        ps2x.read_gamepad(false, 0); // OFF: small motor on/off, larger motor strenght from 0-255
+      }
+      if (ps2x.Analog(PSS_RX) == 0) { // close jaw
+        smoothJawAngle+=2; 
+        if (smoothJawAngle > jawMinMax[1]) {smoothJawAngle = jawMinMax[1]; }
+        ps2x.read_gamepad(true, 0); // small motor on/off, larger motor strenght from 0-255
+        jaw.write(smoothJawAngle);
+        Serial.print("smoothJawAngle Closing Value = "); Serial.println(smoothJawAngle);
+      }
+      else if (ps2x.Analog(PSS_RX) == 255) { // close jaw
+        smoothJawAngle-=2; 
+        if (smoothJawAngle < jawMinMax[0]) {smoothJawAngle = jawMinMax[0]; }
+        ps2x.read_gamepad(false, 255); // small motor on/off, larger motor strenght from 0-255
+        jaw.write(smoothJawAngle);
+        Serial.print("smoothJawAngle Closing Value = "); Serial.println(smoothJawAngle);
+      }
+      else {
+        ps2x.read_gamepad(false, 0); // OFF: small motor on/off, larger motor strenght from 0-255
+      }
+
+      /*************************************************************************************************
+      End of All SERVO Moves
+      **************************************************************************************************/
+    } // end error trap, keep servo commands above this
+  } // end Dual shock controller
+  delay(50);  
+} // main loop ends here
+
+   
+/*************************************************************************************************
+SERVO Functions
+*************************************************************************************************/
+//when wiggle is true, will move the servo back and forth once
+void moveNeutralPosition(bool wiggle) {
+  // set all joints to neutral values & exercise each
+  for (int i = 0; i < 3; i++) { // rows of legs (front, middle, back)
+    for (int j = 0; j < 2; j++) { // sides of robot (left, right)
+      for (int k = 0; k < 3; k++) { // joints per leg (shoulder, elbow, (optional wrist))
+        if(wiggle) {
+          servo[i][j][k].write(npa[i][j][k] - 20); // set all servos to zero value
+          delay(100);
+          servo[i][j][k].write(npa[i][j][k] + 20); // set all servos to zero value
+          delay(100);
+        }
+        servo[i][j][k].write(npa[i][j][k]);  // set all servos to zero value
+        if(wiggle) delay(100);
+        Serial.print("Neutral position values for each joint\t"); // debug assignment values
+        Serial.print(i); Serial.print("\t"); // debug assignment values
+        Serial.print(j); Serial.print("\t");
+        Serial.print(k); Serial.print("\t");
+        Serial.println(npa[i][j][k]);
+      }
+    }
+  }
+} // end neutral position
+
+void wave() {
+  //start by moving to neutral (in case we were walking)
+  moveNeutralPosition(false);
+
+  //lift the front right leg
+  servo[frt][rgt][elb].write(npa[frt][lft][elb]-liftAngle-30);
+  delay(legUpDnDelay);
+  
+  //wave
+  servo[frt][rgt][sdr].write(npa[frt][rgt][sdr]+30);
+  delay(2*legUpDnDelay);
+  servo[frt][rgt][sdr].write(npa[frt][rgt][sdr]-30);
+  delay(2*legUpDnDelay);
+  servo[frt][rgt][sdr].write(npa[frt][rgt][sdr]+30);
+  delay(2*legUpDnDelay);
+  servo[frt][rgt][sdr].write(npa[frt][rgt][sdr]-30);
+  delay(2*legUpDnDelay);
+  
+  //end by returning to the neurtal again
+  moveNeutralPosition(false);
+} //end wave
+
+void tap() { // tap right middle leg on floor  
+  //start by moving to neutral (in case we were walking)
+  moveNeutralPosition(false);
+
+  //lift the middle R leg
+  for (int i = 0; i < 3; i++){
+    servo[mid][rgt][elb].write(npa[mid][rgt][elb]-liftAngle);
+    delay(legUpDnDelay);
+    servo[mid][rgt][elb].write(npa[mid][rgt][elb] + 10);
+    delay(legUpDnDelay);
+  }
+  //end by returning to the neurtal again
+  moveNeutralPosition(false);
+} //end wave
+
+void moveHex(int moveType, int stepAngle, int liftAngle, int lowerAngle, int speedShoulder){
+  if (moveType > 3) {/*Serial.println("move type not recognized");*/ return;} // no motion commanded
+  rgtTripodUpDn(liftAngle);
+  delay(legUpDnDelay);
+
+  switch (moveType){ //what type of move to make?
+    case 0: { // move forward
+      rgtTripodFrtBck(-stepAngle);
+      lftTripodFrtBck(-stepAngle);
+      rgtTripodUpDn(lowerAngle);
+      delay(legUpDnDelay);
+      lftTripodUpDn(liftAngle);
+      delay(legUpDnDelay);    
+      rgtTripodFrtBck(stepAngle);
+      lftTripodFrtBck(stepAngle);     
+      break;
+    } // end case 0
+    case 1: { // move backward
+      rgtTripodFrtBck(stepAngle);
+      lftTripodFrtBck(stepAngle);
+      rgtTripodUpDn(lowerAngle);
+      delay(legUpDnDelay);
+      lftTripodUpDn(liftAngle);
+      delay(legUpDnDelay);    
+      rgtTripodFrtBck(-stepAngle);
+      lftTripodFrtBck(-stepAngle);           
+      break;
+    } // end case 1
+    case 2: { // move counter clockwise
+      rgtTripodSpin(-stepAngle);
+      lftTripodSpin(stepAngle);
+      rgtTripodUpDn(lowerAngle);
+      delay(legUpDnDelay);
+      lftTripodUpDn(liftAngle);
+      delay(legUpDnDelay);    
+      rgtTripodSpin(stepAngle);
+      lftTripodSpin(-stepAngle);                 
+      break;
+    } // end case 2
+    case 3: { // move clockwise
+      rgtTripodSpin(stepAngle);
+      lftTripodSpin(-stepAngle);
+      rgtTripodUpDn(lowerAngle);
+      delay(legUpDnDelay);
+      lftTripodUpDn(liftAngle);
+      delay(legUpDnDelay);    
+      rgtTripodSpin(-stepAngle);
+      lftTripodSpin(stepAngle); 
+      break;      
+    } // end case 3
+    default: {
+      rgtTripodUpDn(lowerAngle); // return R tripod back down
+      delay(legUpDnDelay);
+      return;
+    } // return if nothing found
+  } // end switch moveType 
+  
+  
+  lftTripodUpDn(lowerAngle); // completed 1 full step cycle
+  delay(legUpDnDelay);
+}
+
+// **************************************************************
+void lftTripodSpin(int angle){
+  servo[frt][lft][sdr].write(npa[frt][lft][sdr]+(angle+cornerAdd));
+  //delay(delayTime);
+  servo[mid][rgt][sdr].write(npa[mid][rgt][sdr]+angle);
+  //delay(delayTime);
+  servo[bck][lft][sdr].write(npa[bck][lft][sdr]+(angle+cornerAdd));
+  delay(delayTime);
+} //end lftTripodSpin  
+
+void rgtTripodSpin(int angle){
+  servo[frt][rgt][sdr].write(npa[frt][rgt][sdr]+(angle+cornerAdd));
+  //delay(delayTime);
+  servo[mid][lft][sdr].write(npa[mid][lft][sdr]+angle);
+  //delay(delayTime);
+  servo[bck][rgt][sdr].write(npa[bck][rgt][sdr]+(angle+cornerAdd));
+  delay(delayTime);
+} // end rgtTripodSpin
+
+void lftTripodFrtBck(int angle){
+  servo[frt][lft][sdr].write(npa[frt][lft][sdr]+(angle+cornerAdd));
+  //delay(delayTime);
+  servo[mid][rgt][sdr].write(npa[mid][rgt][sdr]-angle);
+  //delay(delayTime);
+  servo[bck][lft][sdr].write(npa[bck][lft][sdr]+(angle+cornerAdd));
+  delay(delayTime);
+} //end lftTripodFrtBck  
+
+void rgtTripodFrtBck(int angle){
+  servo[frt][rgt][sdr].write(npa[frt][rgt][sdr]+(angle+cornerAdd));
+  //delay(delayTime);
+  servo[mid][lft][sdr].write(npa[mid][lft][sdr]-angle);
+  //delay(delayTime);
+  servo[bck][rgt][sdr].write(npa[bck][rgt][sdr]+(angle+cornerAdd));
+  delay(delayTime);
+} //end rgtTripodFrtBck  
+
+void lftTripodUpDn(int angle){
+  //Pick up legs FL, MR, BL
+  servo[frt][lft][elb].write(npa[frt][lft][elb]-angle);
+  //delay(delayTime);
+  servo[mid][rgt][elb].write(npa[mid][rgt][elb]-angle);
+  //delay(delayTime);
+  servo[bck][lft][elb].write(npa[bck][lft][elb]-angle);
+  delay(delayTime);
+} //end lftTripod  
+
+void rgtTripodUpDn(int angle){
+  servo[frt][rgt][elb].write(npa[frt][rgt][elb]-angle);
+  //delay(delayTime);
+  servo[mid][lft][elb].write(npa[mid][lft][elb]-angle);
+  //delay(delayTime);
+  servo[bck][rgt][elb].write(npa[bck][rgt][elb]-angle);
+  delay(delayTime);
+} //end rgtTripod  
